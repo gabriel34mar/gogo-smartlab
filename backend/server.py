@@ -97,6 +97,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized_device():
             self.send_json(401, {"error": "unauthorized"})
             return
+        if path == "/v1/time":
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            self.send_json(200, {"utc_time": now})
+            return
         if path == "/v1/credentials":
             with connect_db() as db:
                 rows = db.execute(

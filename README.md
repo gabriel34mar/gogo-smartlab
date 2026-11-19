@@ -100,21 +100,47 @@ as the first actuator simulation.
 
 ## Build the RFID proof of concept
 
-With PlatformIO Core installed and the board connected over USB:
+The current firmware uses the Pi as a source of credential updates and event
+storage; access decisions happen on the ESP32 from its persisted local cache.
+It signals with the documented LEDs and buzzer. It does not drive a door lock
+because the project pin map does not specify a lock driver pin or circuit.
+
+1. Copy the local configuration template and edit it:
 
 ```sh
-cd gogo-smartlab/firmware
+cp firmware/secrets.example.h firmware/secrets.h
+```
+
+Set the Wi-Fi SSID/password, Raspberry Pi API address, and the same device token
+used in the Pi's `.env`. Keep `firmware/secrets.h` private; it is ignored by
+Git. Example API address for the current Pi network is
+`http://192.168.1.115:8080`; use the Pi's current LAN IP if it changes.
+
+2. Provision a test card on the Pi. First read its UID in Serial Monitor, then
+run this from the project folder on the Pi:
+
+```sh
+sudo docker compose exec smartlab-api python manage_credential.py add 04A1B2C3 'Test user'
+```
+
+Replace the sample UID with the card's actual UID. The ESP32 refreshes the
+credential snapshot from the Pi at startup and every two minutes. It keeps the
+last valid snapshot for authorization while offline and queues access events
+in LittleFS for upload when connectivity returns. If its 100-event queue fills,
+it denies access rather than granting without being able to persist the event.
+
+3. With PlatformIO Core installed and the ESP32 connected over USB, from the
+firmware folder:
+
+```sh
+cd firmware
 pio run
 pio run --target upload
 pio device monitor
 ```
 
-Expected serial output at 115200 baud: a reader-ready message, then one
-`RFID UID: ...` line for each card presentation. This is a design expectation,
-not a measured result; the firmware has not been compiled or flashed here.
-
-Next implement firmware in small steps: (1) local credential snapshot and
-decision, (2) LED/buzzer outputs based on that local decision, and (3) Wi-Fi
-sync plus a persistent event queue. The PDF specifies the Arduino framework and
-RC522 pin map, but confirm the exact board and installed components before
-wiring or flashing firmware.
+Expected serial output at 115200 baud includes the RFID UID, local decision,
+whether the credential cache loaded, and whether the event was saved. This is a
+design expectation, not a measured result; the firmware has not been compiled
+or flashed here. RFID UID-only cards such as MIFARE Classic can be cloned, so
+this is suitable for a controlled prototype, not strong production security.
