@@ -54,8 +54,20 @@ uint32_t lastWifiAttempt = 0;
 uint32_t lastCredentialSync = 0;
 uint32_t lastEventUpload = 0;
 uint32_t lastTimeSync = 0;
+uint32_t lastHeartbeat = 0;
 SemaphoreHandle_t fsMutex = nullptr;
 SemaphoreHandle_t credentialMutex = nullptr;
+TaskHandle_t rfidTaskHandle = nullptr;
+TaskHandle_t networkTaskHandle = nullptr;
+portMUX_TYPE perfMux = portMUX_INITIALIZER_UNLOCKED;
+
+struct TimingStats {
+  uint32_t rfidReadUs;
+  uint32_t authLookupUs;
+  uint32_t eventSaveUs;
+  uint32_t readerToLedUs;
+};
+TimingStats lastTiming = {};
 
 String apiUrl(const char *path) {
   String base = SMARTLAB_API_BASE_URL;
@@ -203,6 +215,58 @@ bool syncClockFromPi() {
   settimeofday(&tv, nullptr);
   Serial.println("Clock synchronized with Raspberry Pi.");
   return true;
+}
+
+const char *taskStateName(eTaskState state) {
+  switch (state) {
+    case eRunning: return "Running";
+    case eReady: return "Ready";
+    case eBlocked: return "Blocked";
+    case eSuspended: return "Suspended";
+    case eDeleted: return "Deleted";
+    default: return "Invalid";
+  }
+}
+
+void recordTiming(const TimingStats &stats) {
+  portENTER_CRITICAL(&perfMux);
+  lastTiming = stats;
+  portEXIT_CRITICAL(&perfMux);
+}
+
+TimingStats readTiming() {
+  TimingStats stats;
+  portENTER_CRITICAL(&perfMux);
+  stats = lastTiming;
+  portEXIT_CRITICAL(&perfMux);
+  return stats;
+}
+
+void sendHeartbeat() {
+  DynamicJsonDocument doc(768);
+  TimingStats stats = readTiming();
+  eTaskState rfidState = rfidTaskHandle ? eTaskGetState(rfidTaskHandle) : eInvalid;
+  eTaskState networkState = networkTaskHandle ? eTaskGetState(networkTaskHandle) : eInvalid;
+  doc["device_id"] = SMARTLAB_DEVICE_ID;
+  doc["uptime_ms"] = millis();
+  doc["free_heap_bytes"] = ESP.getFreeHeap();
+  doc["rfid_task_state"] = taskStateName(rfidState);
+  doc["network_task_state"] = taskStateName(networkState);
+  doc["last_rfid_read_us"] = stats.rfidReadUs;
+  doc["last_auth_lookup_us"] = stats.authLookupUs;
+  doc["last_event_save_us"] = stats.eventSaveUs;
+  doc["last_reader_to_led_us"] = stats.readerToLedUs;
+  String payload;
+  serializeJson(doc, payload);
+
+  HTTPClient http;
+  if (!authorizedRequest(http, "/v1/devices/heartbeat")) return;
+  http.addHeader("Content-Type", "application/json");
+  int status = http.POST(payload);
+  if (status != HTTP_CODE_OK) {
+    Serial.printf("Heartbeat failed: HTTP %d\n", status);
+  }
+  http.end();
 }
 
 String currentUtcTimestamp() {
@@ -355,6 +419,10 @@ void signalAccess(bool allowed, uint32_t scanStartedUs,
   digitalWrite(LED_GREEN_PIN, allowed ? HIGH : LOW);
   digitalWrite(LED_RED_PIN, allowed ? LOW : HIGH);
   const uint32_t feedbackUs = micros();
+  recordTiming({uidReadyUs - scanStartedUs,
+                decisionReadyUs - uidReadyUs,
+                eventSavedUs - decisionReadyUs,
+                feedbackUs - scanStartedUs});
   Serial.printf("PERF rfid_read_us=%lu auth_lookup_us=%lu event_save_us=%lu "
                 "reader_call_to_led_us=%lu event_saved=%s\n",
                 static_cast<unsigned long>(uidReadyUs - scanStartedUs),
@@ -424,6 +492,10 @@ void networkTask(void *parameter) {
         lastEventUpload = now;
         uploadQueuedEvents();
       }
+      if (now - lastHeartbeat >= 5000) {
+        lastHeartbeat = now;
+        sendHeartbeat();
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(250));
   }
@@ -457,9 +529,9 @@ void setup() {
   Serial.println("GOGO SmartLab FreeRTOS tasks starting.");
 
   BaseType_t rfidCreated = xTaskCreatePinnedToCore(
-      rfidTask, "RFIDTask", 6144, nullptr, 3, nullptr, 1);
+      rfidTask, "RFIDTask", 6144, nullptr, 3, &rfidTaskHandle, 1);
   BaseType_t networkCreated = xTaskCreatePinnedToCore(
-      networkTask, "NetworkTask", 8192, nullptr, 1, nullptr, 0);
+      networkTask, "NetworkTask", 8192, nullptr, 1, &networkTaskHandle, 0);
   if (rfidCreated != pdPASS || networkCreated != pdPASS) {
     Serial.println("Could not create one or more FreeRTOS tasks.");
   }

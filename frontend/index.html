@@ -34,8 +34,18 @@
     .badge { display:inline-block; border-radius:99px; padding:3px 9px; font-size:12px; font-weight:700; }
     .badge.allow { color:var(--teal); background:#143c38; }
     .badge.deny { color:var(--red); background:#45282b; }
+    .badge.online { color:var(--teal); background:#143c38; }
+    .badge.offline { color:#ffcf7a; background:#493b20; }
+    .device-panel { padding:18px; margin:18px 0; }
+    .device-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .task-list,.timing-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:14px; }
+    .task,.timing { background:#101b21; border:1px solid var(--line); border-radius:9px; padding:12px; }
+    .task span,.timing span { display:block; color:var(--muted); font-size:12px; }
+    .task strong,.timing strong { display:block; margin-top:4px; }
+    .timing-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
     .toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px; }
     .hidden { display:none; }
+    @media(max-width:760px) { .timing-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
     @media(max-width:650px) { main { margin:22px auto; } header { align-items:start; flex-direction:column; } .metrics { gap:8px; } .metric { padding:12px; } .metric strong { font-size:23px; } }
   </style>
 </head>
@@ -56,6 +66,11 @@
   </section>
 
   <section id="dashboard" class="hidden">
+    <section class="panel device-panel">
+      <div class="device-head"><div><strong>ESP32 y FreeRTOS</strong><br><small id="deviceMeta">Esperando el primer heartbeat del nodo…</small></div><span id="deviceStatus" class="badge offline">Sin datos</span></div>
+      <div id="deviceTasks" class="task-list"></div>
+      <div id="deviceTimings" class="timing-grid"></div>
+    </section>
     <div class="metrics">
       <article class="metric"><span>Eventos registrados</span><strong id="total">0</strong></article>
       <article class="metric allow"><span>Accesos concedidos</span><strong id="allowed">0</strong></article>
@@ -82,6 +97,49 @@
     return Number.isNaN(date.getTime()) ? value : date.toLocaleString("es-MX", { timeZone: "UTC" }) + " UTC";
   };
 
+  function makeMetric(label, value, className) {
+    const item = document.createElement("div");
+    item.className = className;
+    const caption = document.createElement("span"); caption.textContent = label;
+    const result = document.createElement("strong"); result.textContent = value;
+    item.append(caption, result);
+    return item;
+  }
+
+  async function refreshDevices() {
+    const response = await fetch("/v1/devices", {
+      headers: { "Authorization": `Bearer ${bearer}` }, cache: "no-store"
+    });
+    if (!response.ok) throw new Error(`Estado ESP32: HTTP ${response.status}`);
+    const data = await response.json();
+    const tasks = $("deviceTasks");
+    const timings = $("deviceTimings");
+    tasks.replaceChildren();
+    timings.replaceChildren();
+    if (!data.devices.length) {
+      $("deviceStatus").textContent = "Sin datos";
+      $("deviceStatus").className = "badge offline";
+      $("deviceMeta").textContent = "Aún no se recibió heartbeat del firmware FreeRTOS.";
+      return;
+    }
+    const device = data.devices[0];
+    const seen = Date.parse(device.last_seen_at);
+    const isOnline = Number.isFinite(seen) && Date.now() - seen < 15000;
+    $("deviceStatus").textContent = isOnline ? "En línea" : "Sin heartbeat reciente";
+    $("deviceStatus").className = `badge ${isOnline ? "online" : "offline"}`;
+    $("deviceMeta").textContent = `${device.device_id} · último heartbeat ${dateText(device.last_seen_at)} · uptime ${(device.uptime_ms / 3600000).toFixed(2)} h · heap ${(device.free_heap_bytes / 1024).toFixed(1)} KB`;
+    tasks.append(
+      makeMetric("Tarea RFIDTask · prioridad 3 · core 1", device.rfid_task_state, "task"),
+      makeMetric("Tarea NetworkTask · prioridad 1 · core 0", device.network_task_state, "task")
+    );
+    timings.append(
+      makeMetric("Lectura RFID", `${device.last_rfid_read_us} µs`, "timing"),
+      makeMetric("Búsqueda autorización", `${device.last_auth_lookup_us} µs`, "timing"),
+      makeMetric("Guardar evento", `${device.last_event_save_us} µs`, "timing"),
+      makeMetric("Lector a indicador", `${device.last_reader_to_led_us} µs`, "timing")
+    );
+  }
+
   async function refresh() {
     try {
       const response = await fetch("/v1/events?limit=100", {
@@ -91,6 +149,7 @@
       if (response.status === 401) throw new Error("Token incorrecto o no autorizado.");
       if (!response.ok) throw new Error(`Error del servidor: HTTP ${response.status}`);
       const data = await response.json();
+      await refreshDevices();
       $("total").textContent = data.summary.total;
       $("allowed").textContent = data.summary.authorized;
       $("denied").textContent = data.summary.denied;

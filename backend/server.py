@@ -53,6 +53,18 @@ def initialize() -> None:
             occurred_at TEXT NOT NULL,
             received_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS device_status (
+            device_id TEXT PRIMARY KEY,
+            last_seen_at TEXT NOT NULL,
+            uptime_ms INTEGER NOT NULL,
+            free_heap_bytes INTEGER NOT NULL,
+            rfid_task_state TEXT NOT NULL,
+            network_task_state TEXT NOT NULL,
+            last_rfid_read_us INTEGER NOT NULL,
+            last_auth_lookup_us INTEGER NOT NULL,
+            last_event_save_us INTEGER NOT NULL,
+            last_reader_to_led_us INTEGER NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_events_occurred_at
             ON access_events(occurred_at DESC);
         """)
@@ -156,13 +168,24 @@ class Handler(BaseHTTPRequestHandler):
                 "events": [dict(row) for row in rows],
             })
             return
+        if path == "/v1/devices":
+            with connect_db() as db:
+                rows = db.execute(
+                    "SELECT * FROM device_status ORDER BY last_seen_at DESC"
+                ).fetchall()
+            self.send_json(200, {"devices": [dict(row) for row in rows]})
+            return
         self.send_json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
         if not self.authorized_device():
             self.send_json(401, {"error": "unauthorized"})
             return
-        if urlparse(self.path).path != "/v1/events/batch":
+        path = urlparse(self.path).path
+        if path == "/v1/devices/heartbeat":
+            self.handle_heartbeat()
+            return
+        if path != "/v1/events/batch":
             self.send_json(404, {"error": "not_found"})
             return
         try:
@@ -210,6 +233,57 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": "storage_error"})
             return
         self.send_json(200, {"accepted": len(normalized), "inserted": inserted})
+
+    def handle_heartbeat(self) -> None:
+        try:
+            body = self.read_json()
+            device_id = body.get("device_id")
+            rfid_state = body.get("rfid_task_state")
+            network_state = body.get("network_task_state")
+            if not isinstance(device_id, str) or not 1 <= len(device_id) <= 80:
+                raise ValueError("device_id is required")
+            valid_states = {"Running", "Ready", "Blocked", "Suspended", "Deleted", "Invalid"}
+            if (not isinstance(rfid_state, str) or rfid_state not in valid_states or
+                    not isinstance(network_state, str) or network_state not in valid_states):
+                raise ValueError("invalid FreeRTOS task state")
+            field_names = (
+                "uptime_ms", "free_heap_bytes", "last_rfid_read_us",
+                "last_auth_lookup_us", "last_event_save_us", "last_reader_to_led_us",
+            )
+            values = []
+            for field in field_names:
+                value = body.get(field)
+                if type(value) is not int or value < 0 or value > 2_147_483_647:
+                    raise ValueError(f"{field} must be a non-negative integer")
+                values.append(value)
+        except ValueError as exc:
+            self.send_json(400, {"error": "invalid_request", "detail": str(exc)})
+            return
+
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        try:
+            with connect_db() as db:
+                db.execute("""
+                    INSERT INTO device_status (
+                        device_id, last_seen_at, uptime_ms, free_heap_bytes,
+                        rfid_task_state, network_task_state, last_rfid_read_us,
+                        last_auth_lookup_us, last_event_save_us, last_reader_to_led_us
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(device_id) DO UPDATE SET
+                        last_seen_at = excluded.last_seen_at,
+                        uptime_ms = excluded.uptime_ms,
+                        free_heap_bytes = excluded.free_heap_bytes,
+                        rfid_task_state = excluded.rfid_task_state,
+                        network_task_state = excluded.network_task_state,
+                        last_rfid_read_us = excluded.last_rfid_read_us,
+                        last_auth_lookup_us = excluded.last_auth_lookup_us,
+                        last_event_save_us = excluded.last_event_save_us,
+                        last_reader_to_led_us = excluded.last_reader_to_led_us
+                """, (device_id, now, *values[:2], rfid_state, network_state, *values[2:]))
+        except sqlite3.Error:
+            self.send_json(500, {"error": "storage_error"})
+            return
+        self.send_json(200, {"status": "ok", "received_at": now})
 
     def log_message(self, fmt: str, *args) -> None:
         print(f"{self.address_string()} - {fmt % args}")

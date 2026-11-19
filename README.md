@@ -54,8 +54,10 @@ Git; do not commit its token.
 
 Open `http://<RASPBERRY_PI_IP>:8080/` from a device on the same local network.
 Enter the local API token to view event totals and the latest access records.
-The dashboard refreshes every five seconds. This prototype uses the device API
-token for dashboard reads; use only on the trusted project network.
+The dashboard refreshes every five seconds and includes the ESP32 FreeRTOS task
+states and latest latency measurements when the node sends its heartbeat. This
+prototype uses the device API token for dashboard reads; use only on the trusted
+project network.
 
 Add a test card after reading its UID from the ESP32 serial monitor:
 
