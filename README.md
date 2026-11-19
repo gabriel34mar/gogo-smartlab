@@ -50,6 +50,13 @@ the database is preserved. Do not use `docker compose down -v` unless you
 intend to delete that volume and its database. The `.env` file is excluded from
 Git; do not commit its token.
 
+## Dashboard
+
+Open `http://<RASPBERRY_PI_IP>:8080/` from a device on the same local network.
+Enter the local API token to view event totals and the latest access records.
+The dashboard refreshes every five seconds. This prototype uses the device API
+token for dashboard reads; use only on the trusted project network.
+
 Add a test card after reading its UID from the ESP32 serial monitor:
 
 ```sh
@@ -100,10 +107,12 @@ as the first actuator simulation.
 
 ## Build the RFID proof of concept
 
-The current firmware uses the Pi as a source of credential updates and event
-storage; access decisions happen on the ESP32 from its persisted local cache.
-It signals with the documented LEDs and buzzer. It does not drive a door lock
-because the project pin map does not specify a lock driver pin or circuit.
+The current firmware uses FreeRTOS tasks: `RFIDTask` handles card reads,
+authorization and feedback; `NetworkTask` handles Wi-Fi, credential/time sync
+and event uploads. Access decisions happen on the ESP32 from its persisted
+local cache. It signals with the documented LEDs and buzzer. It does not drive
+a door lock because the project pin map does not specify a lock driver pin or
+circuit.
 
 1. Copy the local configuration template and edit it:
 
@@ -139,8 +148,11 @@ pio run --target upload
 pio device monitor
 ```
 
-Expected serial output at 115200 baud includes the RFID UID, local decision,
-whether the credential cache loaded, and whether the event was saved. This is a
-design expectation, not a measured result; the firmware has not been compiled
-or flashed here. RFID UID-only cards such as MIFARE Classic can be cloned, so
-this is suitable for a controlled prototype, not strong production security.
+Expected serial output at 115200 baud includes the RFID UID and local decision,
+plus `PERF` metrics for RFID read, authorization lookup, event persistence, and
+elapsed time from the RFID task's reader call until the indicator GPIO changes.
+The 10 ms task polling wait before that call is not included, so this is not a
+full RF-field-to-LED measurement. Those values must be measured on the actual
+ESP32; no experimental result is claimed here. RFID UID-only cards
+such as MIFARE Classic can be cloned, so this is a controlled prototype, not
+strong production security.

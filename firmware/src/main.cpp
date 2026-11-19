@@ -8,6 +8,9 @@
 #include <time.h>
 #include <sys/time.h>
 #include <vector>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 #include "secrets.h"
 
@@ -51,6 +54,8 @@ uint32_t lastWifiAttempt = 0;
 uint32_t lastCredentialSync = 0;
 uint32_t lastEventUpload = 0;
 uint32_t lastTimeSync = 0;
+SemaphoreHandle_t fsMutex = nullptr;
+SemaphoreHandle_t credentialMutex = nullptr;
 
 String apiUrl(const char *path) {
   String base = SMARTLAB_API_BASE_URL;
@@ -145,17 +150,22 @@ bool syncCredentialSnapshot() {
     newUids.push_back(uid);
   }
 
+  if (xSemaphoreTake(fsMutex, portMAX_DELAY) != pdTRUE) return false;
   File file = LittleFS.open(CREDENTIALS_PATH, "w");
   if (!file) {
+    xSemaphoreGive(fsMutex);
     Serial.println("Could not persist credential snapshot.");
     return false;
   }
   size_t written = serializeJson(doc, file);
   file.close();
+  xSemaphoreGive(fsMutex);
   if (written == 0) return false;
 
+  xSemaphoreTake(credentialMutex, portMAX_DELAY);
   authorizedUids = newUids;
   credentialSnapshotLoaded = true;
+  xSemaphoreGive(credentialMutex);
   Serial.printf("Credential snapshot updated (%u cards, version %s).\n",
                 static_cast<unsigned>(authorizedUids.size()),
                 doc["version"].as<const char *>());
@@ -235,12 +245,15 @@ bool saveEventQueue(JsonArrayConst queue) {
 
 bool appendEvent(const String &uid, bool allowed) {
   DynamicJsonDocument doc(36000);
+  if (xSemaphoreTake(fsMutex, portMAX_DELAY) != pdTRUE) return false;
   if (!readEventQueue(doc)) {
+    xSemaphoreGive(fsMutex);
     Serial.println("Event queue is unreadable; refusing to grant access.");
     return false;
   }
   JsonArray queue = doc.as<JsonArray>();
   if (queue.size() >= MAX_QUEUED_EVENTS) {
+    xSemaphoreGive(fsMutex);
     Serial.println("Event queue full; refusing access until synchronization.");
     return false;
   }
@@ -252,20 +265,32 @@ bool appendEvent(const String &uid, bool allowed) {
   event["authorized"] = allowed;
   event["occurred_at"] = currentUtcTimestamp();
   event["timestamp_valid"] = time(nullptr) >= 1760000000;
-  return saveEventQueue(queue);
+  bool saved = saveEventQueue(queue);
+  xSemaphoreGive(fsMutex);
+  return saved;
 }
 
 void uploadQueuedEvents() {
   DynamicJsonDocument doc(36000);
+  if (xSemaphoreTake(fsMutex, portMAX_DELAY) != pdTRUE) return;
   if (!readEventQueue(doc)) {
+    xSemaphoreGive(fsMutex);
     Serial.println("Cannot read event queue; keeping local data.");
     return;
   }
   JsonArray queue = doc.as<JsonArray>();
-  if (queue.size() == 0) return;
+  if (queue.size() == 0) {
+    xSemaphoreGive(fsMutex);
+    return;
+  }
+  const size_t batchCount = queue.size();
+  std::vector<String> sentIds;
+  sentIds.reserve(batchCount);
+  for (JsonObject event : queue) sentIds.push_back(event["event_id"].as<String>());
 
   DynamicJsonDocument requestDoc(36000);
   requestDoc["events"] = queue;
+  xSemaphoreGive(fsMutex);
   String payload;
   serializeJson(requestDoc, payload);
 
@@ -283,30 +308,60 @@ void uploadQueuedEvents() {
   DynamicJsonDocument response(256);
   DeserializationError error = deserializeJson(response, http.getString());
   http.end();
-  if (error || response["accepted"].as<size_t>() != queue.size()) {
+  if (error || response["accepted"].as<size_t>() != batchCount) {
     Serial.println("Server acknowledgement did not match; keeping local events.");
     return;
   }
 
-  DynamicJsonDocument empty(64);
-  empty.to<JsonArray>();
-  if (saveEventQueue(empty.as<JsonArrayConst>())) {
-    Serial.printf("Uploaded %u queued events.\n",
-                  static_cast<unsigned>(queue.size()));
+  DynamicJsonDocument currentDoc(36000);
+  DynamicJsonDocument remainingDoc(36000);
+  if (xSemaphoreTake(fsMutex, portMAX_DELAY) != pdTRUE) return;
+  bool queueRead = readEventQueue(currentDoc);
+  if (queueRead) {
+    JsonArray remaining = remainingDoc.to<JsonArray>();
+    for (JsonObjectConst event : currentDoc.as<JsonArrayConst>()) {
+      String id = event["event_id"].as<String>();
+      bool wasSent = false;
+      for (const String &sentId : sentIds) {
+        if (id == sentId) { wasSent = true; break; }
+      }
+      if (!wasSent) remaining.add(event);
+    }
+    queueRead = saveEventQueue(remaining);
   }
+  xSemaphoreGive(fsMutex);
+  if (queueRead) Serial.printf("Uploaded %u queued events.\n", static_cast<unsigned>(batchCount));
 }
 
 bool isAuthorized(const String &uid) {
-  if (!credentialSnapshotLoaded) return false;
-  for (const String &authorizedUid : authorizedUids) {
-    if (uid == authorizedUid) return true;
+  if (xSemaphoreTake(credentialMutex, portMAX_DELAY) != pdTRUE) return false;
+  if (!credentialSnapshotLoaded) {
+    xSemaphoreGive(credentialMutex);
+    return false;
   }
+  for (const String &authorizedUid : authorizedUids) {
+    if (uid == authorizedUid) {
+      xSemaphoreGive(credentialMutex);
+      return true;
+    }
+  }
+  xSemaphoreGive(credentialMutex);
   return false;
 }
 
-void signalAccess(bool allowed) {
+void signalAccess(bool allowed, uint32_t scanStartedUs,
+                  uint32_t uidReadyUs, uint32_t decisionReadyUs,
+                  uint32_t eventSavedUs, bool recorded) {
   digitalWrite(LED_GREEN_PIN, allowed ? HIGH : LOW);
   digitalWrite(LED_RED_PIN, allowed ? LOW : HIGH);
+  const uint32_t feedbackUs = micros();
+  Serial.printf("PERF rfid_read_us=%lu auth_lookup_us=%lu event_save_us=%lu "
+                "reader_call_to_led_us=%lu event_saved=%s\n",
+                static_cast<unsigned long>(uidReadyUs - scanStartedUs),
+                static_cast<unsigned long>(decisionReadyUs - uidReadyUs),
+                static_cast<unsigned long>(eventSavedUs - decisionReadyUs),
+                static_cast<unsigned long>(feedbackUs - scanStartedUs),
+                recorded ? "yes" : "no");
   if (!allowed) {
     digitalWrite(BUZZER_PIN, HIGH);
     delay(180);
@@ -317,21 +372,61 @@ void signalAccess(bool allowed) {
   digitalWrite(LED_RED_PIN, LOW);
 }
 
-void handleCard() {
-  if (!reader.PICC_IsNewCardPresent() || !reader.PICC_ReadCardSerial()) return;
+void rfidTask(void *parameter) {
+  (void)parameter;
+  for (;;) {
+    const uint32_t scanStartedUs = micros();
+    if (!reader.PICC_IsNewCardPresent() || !reader.PICC_ReadCardSerial()) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
 
-  String uid = normalizedUid(reader.uid);
-  bool allowed = isAuthorized(uid);
-  bool recorded = appendEvent(uid, allowed);
-  if (!recorded) allowed = false;  // No grant when the audit event cannot persist.
+    String uid = normalizedUid(reader.uid);
+    const uint32_t uidReadyUs = micros();
+    bool allowed = isAuthorized(uid);
+    const uint32_t decisionReadyUs = micros();
+    bool recorded = appendEvent(uid, allowed);
+    const uint32_t eventSavedUs = micros();
+    if (!recorded) allowed = false;  // No grant when the audit event cannot persist.
 
-  Serial.printf("UID=%s decision=%s cache=%s event_saved=%s\n",
-                uid.c_str(), allowed ? "ALLOW" : "DENY",
-                credentialSnapshotLoaded ? "loaded" : "missing",
-                recorded ? "yes" : "no");
-  signalAccess(allowed);
-  reader.PICC_HaltA();
-  reader.PCD_StopCrypto1();
+    Serial.printf("UID=%s decision=%s cache=%s\n",
+                  uid.c_str(), allowed ? "ALLOW" : "DENY",
+                  credentialSnapshotLoaded ? "loaded" : "missing");
+    signalAccess(allowed, scanStartedUs, uidReadyUs, decisionReadyUs,
+                 eventSavedUs, recorded);
+    reader.PICC_HaltA();
+    reader.PCD_StopCrypto1();
+    vTaskDelay(pdMS_TO_TICKS(30));
+  }
+}
+
+void networkTask(void *parameter) {
+  (void)parameter;
+  startWifi();
+  lastCredentialSync = millis() - CREDENTIAL_SYNC_MS;
+  lastTimeSync = millis() - TIME_SYNC_MS;
+
+  for (;;) {
+    const uint32_t now = millis();
+    if (WiFi.status() != WL_CONNECTED && now - lastWifiAttempt >= WIFI_RETRY_MS) {
+      startWifi();
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      if (now - lastCredentialSync >= CREDENTIAL_SYNC_MS) {
+        lastCredentialSync = now;
+        syncCredentialSnapshot();
+      }
+      if (now - lastTimeSync >= TIME_SYNC_MS) {
+        lastTimeSync = now;
+        syncClockFromPi();
+      }
+      if (now - lastEventUpload >= EVENT_UPLOAD_MS) {
+        lastEventUpload = now;
+        uploadQueuedEvents();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(250));
+  }
 }
 
 void setup() {
@@ -343,6 +438,13 @@ void setup() {
   digitalWrite(LED_RED_PIN, LOW);
   digitalWrite(BUZZER_PIN, LOW);
 
+  fsMutex = xSemaphoreCreateMutex();
+  credentialMutex = xSemaphoreCreateMutex();
+  if (fsMutex == nullptr || credentialMutex == nullptr) {
+    Serial.println("Could not create FreeRTOS mutexes; halting.");
+    while (true) vTaskDelay(portMAX_DELAY);
+  }
+
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS mount failed; access will remain denied.");
   } else {
@@ -352,33 +454,17 @@ void setup() {
   SPI.begin(18, 19, 23, RFID_SS_PIN);  // SCK, MISO, MOSI, SS
   reader.PCD_Init();
   delay(50);
-  startWifi();
-  lastCredentialSync = millis() - CREDENTIAL_SYNC_MS;
-  lastTimeSync = millis() - TIME_SYNC_MS;
-  Serial.println("GOGO SmartLab ready. Local cache authorizes cards when offline.");
+  Serial.println("GOGO SmartLab FreeRTOS tasks starting.");
+
+  BaseType_t rfidCreated = xTaskCreatePinnedToCore(
+      rfidTask, "RFIDTask", 6144, nullptr, 3, nullptr, 1);
+  BaseType_t networkCreated = xTaskCreatePinnedToCore(
+      networkTask, "NetworkTask", 8192, nullptr, 1, nullptr, 0);
+  if (rfidCreated != pdPASS || networkCreated != pdPASS) {
+    Serial.println("Could not create one or more FreeRTOS tasks.");
+  }
 }
 
 void loop() {
-  uint32_t now = millis();
-  if (WiFi.status() != WL_CONNECTED && now - lastWifiAttempt >= WIFI_RETRY_MS) {
-    startWifi();
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    if (now - lastCredentialSync >= CREDENTIAL_SYNC_MS) {
-      lastCredentialSync = now;
-      syncCredentialSnapshot();
-    }
-    if (now - lastTimeSync >= TIME_SYNC_MS) {
-      lastTimeSync = now;
-      syncClockFromPi();
-    }
-    if (now - lastEventUpload >= EVENT_UPLOAD_MS) {
-      lastEventUpload = now;
-      uploadQueuedEvents();
-    }
-  }
-
-  handleCard();
-  delay(10);
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }

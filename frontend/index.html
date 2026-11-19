@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GOGO SmartLab | Accesos</title>
+  <style>
+    :root { color-scheme: dark; --bg:#101820; --panel:#182630; --line:#2a3b46; --muted:#a5b3bb; --text:#edf4f6; --teal:#42d6c4; --red:#ff7777; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; }
+    main { width:min(1120px, calc(100% - 32px)); margin:38px auto; }
+    header { display:flex; justify-content:space-between; align-items:end; gap:16px; margin-bottom:24px; }
+    h1 { margin:0; font-size:clamp(25px,4vw,36px); letter-spacing:-.04em; }
+    .eyebrow { color:var(--teal); font-size:12px; font-weight:700; letter-spacing:.13em; text-transform:uppercase; }
+    .muted, small { color:var(--muted); }
+    .panel,.metric { background:var(--panel); border:1px solid var(--line); border-radius:14px; }
+    .login { padding:20px; display:flex; gap:10px; align-items:end; flex-wrap:wrap; margin-bottom:18px; }
+    label { display:block; color:var(--muted); font-size:13px; margin-bottom:6px; }
+    .field { flex:1; min-width:220px; }
+    input { width:100%; padding:11px 12px; color:var(--text); background:#0e171d; border:1px solid var(--line); border-radius:8px; }
+    button { border:0; border-radius:8px; padding:11px 16px; background:var(--teal); color:#062521; font-weight:700; cursor:pointer; }
+    button.secondary { color:var(--text); background:#263a45; }
+    .status { min-height:24px; color:var(--muted); }
+    .metrics { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin:18px 0; }
+    .metric { padding:18px; }
+    .metric span { display:block; color:var(--muted); font-size:13px; }
+    .metric strong { display:block; margin-top:6px; font-size:28px; }
+    .metric.allow strong { color:var(--teal); }
+    .metric.deny strong { color:var(--red); }
+    .table-wrap { overflow:auto; }
+    table { width:100%; border-collapse:collapse; min-width:720px; }
+    th,td { text-align:left; padding:12px 14px; border-bottom:1px solid var(--line); }
+    th { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
+    .badge { display:inline-block; border-radius:99px; padding:3px 9px; font-size:12px; font-weight:700; }
+    .badge.allow { color:var(--teal); background:#143c38; }
+    .badge.deny { color:var(--red); background:#45282b; }
+    .toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px; }
+    .hidden { display:none; }
+    @media(max-width:650px) { main { margin:22px auto; } header { align-items:start; flex-direction:column; } .metrics { gap:8px; } .metric { padding:12px; } .metric strong { font-size:23px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div><div class="eyebrow">GOGO SmartLab · Servidor local</div><h1>Registro de accesos</h1></div>
+    <div id="connection" class="status">Sin conexión al panel</div>
+  </header>
+
+  <section class="panel login" id="loginPanel">
+    <div class="field">
+      <label for="token">Token local del servidor</label>
+      <input id="token" type="password" autocomplete="off" placeholder="Pega el token configurado en la Raspberry">
+    </div>
+    <button id="connect">Conectar</button>
+    <small>El token se conserva solo en esta pestaña.</small>
+  </section>
+
+  <section id="dashboard" class="hidden">
+    <div class="metrics">
+      <article class="metric"><span>Eventos registrados</span><strong id="total">0</strong></article>
+      <article class="metric allow"><span>Accesos concedidos</span><strong id="allowed">0</strong></article>
+      <article class="metric deny"><span>Accesos denegados</span><strong id="denied">0</strong></article>
+    </div>
+    <section class="panel">
+      <div class="toolbar"><div><strong>Actividad reciente</strong><br><small>Actualiza automáticamente cada 5 segundos</small></div><button class="secondary" id="logout">Desconectar</button></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Fecha UTC</th><th>Usuario / UID</th><th>Dispositivo</th><th>Resultado</th></tr></thead>
+          <tbody id="rows"><tr><td colspan="4" class="muted">Conecta para cargar eventos.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </section>
+</main>
+<script>
+  let bearer = "";
+  let refreshTimer = null;
+  const $ = (id) => document.getElementById(id);
+  const setStatus = (message) => { $("connection").textContent = message; };
+  const dateText = (value) => {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleString("es-MX", { timeZone: "UTC" }) + " UTC";
+  };
+
+  async function refresh() {
+    try {
+      const response = await fetch("/v1/events?limit=100", {
+        headers: { "Authorization": `Bearer ${bearer}` },
+        cache: "no-store"
+      });
+      if (response.status === 401) throw new Error("Token incorrecto o no autorizado.");
+      if (!response.ok) throw new Error(`Error del servidor: HTTP ${response.status}`);
+      const data = await response.json();
+      $("total").textContent = data.summary.total;
+      $("allowed").textContent = data.summary.authorized;
+      $("denied").textContent = data.summary.denied;
+      const tbody = $("rows");
+      tbody.replaceChildren();
+      if (data.events.length === 0) {
+        const row = tbody.insertRow();
+        const cell = row.insertCell(); cell.colSpan = 4; cell.className = "muted"; cell.textContent = "Aún no hay eventos.";
+      }
+      for (const event of data.events) {
+        const row = tbody.insertRow();
+        row.insertCell().textContent = dateText(event.occurred_at);
+        row.insertCell().textContent = event.user_label || event.card_uid;
+        row.insertCell().textContent = event.device_id;
+        const badge = document.createElement("span");
+        badge.className = `badge ${event.authorized ? "allow" : "deny"}`;
+        badge.textContent = event.authorized ? "Concedido" : "Denegado";
+        row.insertCell().appendChild(badge);
+      }
+      setStatus(`Conectado · actualizado ${new Date().toLocaleTimeString("es-MX")}`);
+      $("dashboard").classList.remove("hidden");
+    } catch (error) {
+      setStatus(error.message);
+      if (error.message.includes("Token incorrecto")) disconnect();
+    }
+  }
+
+  function disconnect() {
+    bearer = "";
+    if (refreshTimer) clearInterval(refreshTimer);
+    refreshTimer = null;
+    $("dashboard").classList.add("hidden");
+    $("loginPanel").classList.remove("hidden");
+    $("token").value = "";
+    setStatus("Desconectado");
+  }
+
+  $("connect").addEventListener("click", async () => {
+    bearer = $("token").value.trim();
+    if (!bearer) { setStatus("Escribe el token del servidor."); return; }
+    $("loginPanel").classList.add("hidden");
+    await refresh();
+    if (bearer) refreshTimer = setInterval(refresh, 5000);
+  });
+  $("token").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") $("connect").click();
+  });
+  $("logout").addEventListener("click", disconnect);
+</script>
+</body>
+</html>

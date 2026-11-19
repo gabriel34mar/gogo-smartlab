@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 
 ROOT = Path(__file__).resolve().parent
+FRONTEND_PATH = ROOT.parent / "frontend" / "index.html"
 DB_PATH = Path(os.environ.get("SMARTLAB_DB", ROOT / "smartlab.db"))
 HOST = os.environ.get("SMARTLAB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("SMARTLAB_PORT", "8080"))
@@ -69,6 +70,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_html(self, status: int, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def authorized_device(self) -> bool:
         supplied = self.headers.get("Authorization", "")
         expected = f"Bearer {DEVICE_TOKEN}"
@@ -94,6 +103,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self.send_json(200, {"status": "ok"})
             return
+        if path == "/":
+            try:
+                self.send_html(200, FRONTEND_PATH.read_bytes())
+            except OSError:
+                self.send_json(500, {"error": "dashboard_unavailable"})
+            return
         if not self.authorized_device():
             self.send_json(401, {"error": "unauthorized"})
             return
@@ -109,6 +124,37 @@ class Handler(BaseHTTPRequestHandler):
             uids = [row["card_uid"] for row in rows]
             version = hashlib.sha256("\n".join(uids).encode()).hexdigest()[:16]
             self.send_json(200, {"version": version, "credentials": uids})
+            return
+        if path == "/v1/events":
+            try:
+                query = urlparse(self.path).query
+                limit = 100
+                for item in query.split("&"):
+                    key, _, value = item.partition("=")
+                    if key == "limit":
+                        limit = max(1, min(200, int(value)))
+            except ValueError:
+                self.send_json(400, {"error": "invalid_limit"})
+                return
+            with connect_db() as db:
+                totals = db.execute("""
+                    SELECT COUNT(*) AS total,
+                           COALESCE(SUM(authorized), 0) AS authorized,
+                           COALESCE(SUM(CASE WHEN authorized = 0 THEN 1 ELSE 0 END), 0) AS denied
+                    FROM access_events
+                """).fetchone()
+                rows = db.execute("""
+                    SELECT e.event_id, e.device_id, e.card_uid, e.authorized,
+                           e.occurred_at, e.received_at, c.user_label
+                    FROM access_events AS e
+                    LEFT JOIN credentials AS c ON c.card_uid = e.card_uid
+                    ORDER BY e.received_at DESC
+                    LIMIT ?
+                """, (limit,)).fetchall()
+            self.send_json(200, {
+                "summary": dict(totals),
+                "events": [dict(row) for row in rows],
+            })
             return
         self.send_json(404, {"error": "not_found"})
 

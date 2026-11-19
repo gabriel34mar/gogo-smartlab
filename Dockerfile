@@ -8,6 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 COPY backend/ /app/backend/
+COPY frontend/ /app/frontend/
 
 RUN addgroup --system --gid 10001 smartlab \
     && adduser --system --uid 10001 --ingroup smartlab smartlab \
