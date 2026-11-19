@@ -1,0 +1,7 @@
+.git
+.DS_Store
+.env
+.pio
+__pycache__
+*.py[cod]
+backend/smartlab.db

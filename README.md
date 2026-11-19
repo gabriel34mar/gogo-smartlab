@@ -26,6 +26,30 @@ The server listens on port 8080 by default and creates `smartlab.db` beside the
 Python files. Keep the token private; the prototype uses plain HTTP and should
 only run on a trusted isolated development network.
 
+## Run the API in Docker
+
+Docker Compose keeps the SQLite file in a named volume, so it persists when the
+container is recreated. On the Raspberry Pi, from the project directory:
+
+```sh
+cp .env.example .env
+```
+
+Edit `.env` and replace the sample token with a long random value, then start
+the service:
+
+```sh
+docker compose up -d --build
+docker compose ps
+docker compose logs -f smartlab-api
+```
+
+The API is available on port 8080 of the Pi. To stop it, run
+`docker compose down`. The named `smartlab_data` volume remains in place, so
+the database is preserved. Do not use `docker compose down -v` unless you
+intend to delete that volume and its database. The `.env` file is excluded from
+Git; do not commit its token.
+
 Add a test card after reading its UID from the ESP32 serial monitor:
 
 ```sh

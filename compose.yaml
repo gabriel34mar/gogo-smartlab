@@ -1,0 +1,26 @@
+services:
+  smartlab-api:
+    build: .
+    container_name: smartlab-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SMARTLAB_HOST: 0.0.0.0
+      SMARTLAB_PORT: 8080
+      SMARTLAB_DB: /data/smartlab.db
+    ports:
+      - "${SMARTLAB_BIND_IP:-0.0.0.0}:8080:8080"
+    volumes:
+      - smartlab_data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+
+volumes:
+  smartlab_data:
